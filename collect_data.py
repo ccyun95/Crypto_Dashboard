@@ -1,66 +1,59 @@
 import pandas as pd
-import requests
+import cloudscraper
+import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import datetime
 import os
+import io
 import time
 
-# --- 1. 데이터 수집 함수 ---
+# Cloudflare 우회용 스크래퍼 생성
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
+    }
+)
 
 def fetch_stablecoin_mcap():
-    """DeFiLlama: 전체 스테이블코인 시가총액"""
+    """DeFiLlama: Cloudscraper 적용"""
     print("Fetching Stablecoin Data...")
     try:
         url = "https://stablecoins.llama.fi/stablecoincharts/all"
-        response = requests.get(url).json()
+        response = scraper.get(url, timeout=15).json()
+        
         df = pd.DataFrame(response)
-        df['date'] = pd.to_datetime(df['date'], unit='s')
+        df['date'] = pd.to_datetime(df['date'].astype(float), unit='s')
         df.set_index('date', inplace=True)
-        df = df['totalCirculating'].rename("Stablecoin_Market_Cap")
-        return df
+        return df['totalCirculating'].rename("Stablecoin_Market_Cap")
     except Exception as e:
         print(f"Error fetching Stablecoins: {e}")
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float, name="Stablecoin_Market_Cap")
 
-def fetch_etf_flows():
-    """Farside: 비트코인 현물 ETF 순유입 (크롤링)"""
-    print("Fetching ETF Flows...")
+def fetch_etf_volume():
+    """
+    대체 전략: Farside 크롤링이 막히면 Yahoo Finance API 사용
+    (순유입 데이터 대신 거래량으로 대체 - 차단 가능성 거의 없음)
+    """
+    print("Fetching ETF Volume (IBIT)...")
     try:
-        # User-Agent 설정 필수
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        url = "https://farside.co.uk/btc/"
-        # pandas의 read_html로 테이블 추출
-        dfs = pd.read_html(requests.get(url, headers=headers).text)
+        # 블랙록 ETF (IBIT) 데이터 가져오기
+        ibit = yf.Ticker("IBIT")
+        # 최근 1년 데이터
+        hist = ibit.history(period="1y")
         
-        # Farside 테이블 구조에 맞춰 데이터 정제 (가장 큰 테이블이 데이터일 확률 높음)
-        df = dfs[0]
-        # 날짜 컬럼과 Total 컬럼만 필요 (구조 변경 가능성 있음)
-        # 예시: Date, Total Flow 컬럼 찾기 (실제 컬럼명 확인 필요, 여기선 가정하에 작성)
-        df.columns = df.columns.astype(str) # 컬럼명을 문자로 통일
-        
-        # 'Date'와 'Total'이 포함된 컬럼 찾기
-        date_col = [c for c in df.columns if 'Date' in c][0]
-        total_col = [c for c in df.columns if 'Total' in c][0]
-        
-        df = df[[date_col, total_col]].copy()
-        df.columns = ['date', 'ETF_Net_Flow']
-        
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        df.dropna(subset=['date'], inplace=True)
-        df.set_index('date', inplace=True)
-        
-        # 값에 있는 '$', ',' 제거 후 숫자 변환
-        df['ETF_Net_Flow'] = df['ETF_Net_Flow'].astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False)
-        df['ETF_Net_Flow'] = pd.to_numeric(df['ETF_Net_Flow'], errors='coerce')
-        
-        return df['ETF_Net_Flow']
+        # 거래대금 = 거래량 * 종가 (대략적 추정)
+        # 순유입과 비례하는 경향이 있음
+        etf_flow_proxy = hist['Volume'] * hist['Close']
+        return etf_flow_proxy.rename("ETF_Volume_Proxy")
     except Exception as e:
-        print(f"Error fetching ETF Flows: {e}")
-        return pd.Series(dtype=float)
+        print(f"Error fetching ETF Data: {e}")
+        return pd.Series(dtype=float, name="ETF_Volume_Proxy")
 
 def fetch_realized_cap():
-    """CoinMetrics: BTC 실현 시가총액 (Community API)"""
+    """CoinMetrics: 여전히 차단될 수 있으나 Scraper로 시도"""
     print("Fetching Realized Cap...")
     try:
         url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
@@ -68,114 +61,97 @@ def fetch_realized_cap():
             "assets": "btc",
             "metrics": "CapRealizedUSD",
             "frequency": "1d",
-            "page_size": 365 # 최근 1년
+            "page_size": 365
         }
-        response = requests.get(url, params=params).json()
-        data = response['data']
+        # Scraper 사용
+        response = scraper.get(url, params=params, timeout=15).json()
         
-        df = pd.DataFrame(data)
+        if 'data' not in response:
+            return pd.Series(dtype=float, name="BTC_Realized_Cap")
+
+        df = pd.DataFrame(response['data'])
         df['time'] = pd.to_datetime(df['time'])
         df.set_index('time', inplace=True)
         df['CapRealizedUSD'] = pd.to_numeric(df['CapRealizedUSD'])
         return df['CapRealizedUSD'].rename("BTC_Realized_Cap")
     except Exception as e:
         print(f"Error fetching Realized Cap: {e}")
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float, name="BTC_Realized_Cap")
 
 def fetch_open_interest():
-    """Binance Futures: BTCUSDT 미결제 약정"""
+    """Binance: API 차단 시 Coinglass 대체 불가(유료) -> 데이터 없을 시 0 처리"""
     print("Fetching Open Interest...")
     try:
         url = "https://fapi.binance.com/fapi/v1/openInterestHist"
-        params = {
-            "symbol": "BTCUSDT",
-            "period": "1d",
-            "limit": 365
-        }
-        response = requests.get(url, params=params).json()
+        params = {"symbol": "BTCUSDT", "period": "1d", "limit": 365}
+        
+        # Scraper 사용
+        response = scraper.get(url, params=params, timeout=15).json()
+
+        if isinstance(response, dict): # 에러 메시지인 경우
+             print("Binance blocked this IP.")
+             return pd.Series(dtype=float, name="Binance_BTC_OI")
+
         df = pd.DataFrame(response)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
         df.set_index('timestamp', inplace=True)
-        # sumOpenInterestValue: 달러 환산 가치
         return df['sumOpenInterestValue'].astype(float).rename("Binance_BTC_OI")
     except Exception as e:
         print(f"Error fetching OI: {e}")
-        return pd.Series(dtype=float)
-
-# Glassnode는 유료 API 키가 없으면 데이터 수집 불가하므로 제외하거나
-# 키가 있을 때만 작동하도록 구성
-def fetch_glassnode_reserves(api_key):
-    if not api_key:
-        print("Skipping Glassnode (No API Key)")
-        return pd.Series(dtype=float)
-    # ... (API 호출 로직) ...
-    return pd.Series(dtype=float)
-
-# --- 2. 데이터 병합 및 CSV 저장 ---
+        return pd.Series(dtype=float, name="Binance_BTC_OI")
 
 def update_data():
-    # 각 데이터 수집
-    stablecoin = fetch_stablecoin_mcap()
-    etf = fetch_etf_flows()
-    realized_cap = fetch_realized_cap()
-    oi = fetch_open_interest()
+    s1 = fetch_stablecoin_mcap()
+    s2 = fetch_etf_volume() # ETF 순유입 -> 거래량으로 대체
+    s3 = fetch_realized_cap()
+    s4 = fetch_open_interest()
     
-    # 데이터프레임 병합 (Outer Join으로 날짜 맞춤)
-    dfs = [stablecoin, etf, realized_cap, oi]
+    dfs = [s1, s2, s3, s4]
     final_df = pd.concat(dfs, axis=1)
     
-    # 최근 1년치 데이터로 필터링
-    one_year_ago = pd.Timestamp.now() - pd.DateOffset(days=365)
+    # 컬럼 누락 방지
+    expected = ["Stablecoin_Market_Cap", "ETF_Volume_Proxy", "BTC_Realized_Cap", "Binance_BTC_OI"]
+    for col in expected:
+        if col not in final_df.columns:
+            final_df[col] = float('nan')
+
+    # 최근 1년 필터링
+    one_year_ago = pd.Timestamp.now(tz=datetime.timezone.utc).tz_localize(None) - pd.DateOffset(days=365)
+    # 인덱스 TZ 정보 제거 (병합 시 문제 방지)
+    final_df.index = final_df.index.tz_localize(None)
     final_df = final_df[final_df.index >= one_year_ago]
     
-    # 날짜순 정렬 및 결측치 보간 (ETF 주말 비는 것 등 처리)
     final_df.sort_index(inplace=True)
-    final_df.fillna(method='ffill', inplace=True) # 전일 데이터로 채움
+    final_df.ffill(inplace=True)
     
-    # CSV 저장
     os.makedirs('data', exist_ok=True)
     final_df.to_csv('data/crypto_data.csv')
-    print("CSV Saved.")
     return final_df
 
-# --- 3. HTML 차트 생성 ---
-
 def generate_html(df):
-    print("Generating HTML...")
-    
-    # 4개의 서브플롯 생성
+    if df.empty: return
+
     fig = make_subplots(
         rows=4, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.05,
         subplot_titles=(
-            "Stablecoin Market Cap (Liquidity)", 
-            "Bitcoin Spot ETF Net Flows (Institutional)",
-            "BTC Realized Cap (On-Chain Value)",
-            "Binance Open Interest (Speculation)"
+            "Stablecoin Liquidity (DeFiLlama)", 
+            "IBIT ETF Volume (Yahoo Finance Proxy)",
+            "BTC Realized Cap (CoinMetrics)",
+            "Binance Open Interest"
         )
     )
 
-    # 1. Stablecoin
-    fig.add_trace(go.Scatter(x=df.index, y=df['Stablecoin_Market_Cap'], name="Stablecoin Cap", line=dict(color='green')), row=1, col=1)
-    
-    # 2. ETF (Bar chart)
-    colors = ['red' if x < 0 else 'green' for x in df['ETF_Net_Flow']]
-    fig.add_trace(go.Bar(x=df.index, y=df['ETF_Net_Flow'], name="ETF Flows", marker_color=colors), row=2, col=1)
-    
-    # 3. Realized Cap
-    fig.add_trace(go.Scatter(x=df.index, y=df['BTC_Realized_Cap'], name="Realized Cap", line=dict(color='orange')), row=3, col=1)
-    
-    # 4. Open Interest
-    fig.add_trace(go.Scatter(x=df.index, y=df['Binance_BTC_OI'], name="Open Interest", line=dict(color='blue')), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Stablecoin_Market_Cap'], name="Stablecoin", line=dict(color='green')), row=1, col=1)
+    fig.add_trace(go.Bar(x=df.index, y=df['ETF_Volume_Proxy'], name="ETF Volume", marker_color='orange'), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['BTC_Realized_Cap'], name="Realized Cap", line=dict(color='blue')), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Binance_BTC_OI'], name="Open Interest", line=dict(color='red')), row=4, col=1)
 
-    fig.update_layout(height=1200, title_text=f"Crypto Market Flows Dashboard (Updated: {datetime.datetime.now().strftime('%Y-%m-%d')})", template="plotly_dark")
+    fig.update_layout(height=1200, title_text="Crypto Dashboard (Cloudscraper Ver.)", template="plotly_dark")
     
     os.makedirs('docs', exist_ok=True)
     fig.write_html("docs/index.html")
-    print("HTML Generated.")
 
 if __name__ == "__main__":
     df = update_data()
     generate_html(df)
-  
