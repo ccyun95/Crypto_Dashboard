@@ -1,6 +1,6 @@
 pandas
-requests
 plotly
+cloudscraper
+yfinance
 lxml
-beautifulsoup4
-html5lib
+openpyxl
